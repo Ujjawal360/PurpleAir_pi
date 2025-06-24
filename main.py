@@ -1,15 +1,21 @@
-# Read from serial and plot in real-time
-import serial
+import pyqtgraph as pg
 import pandas as pd
-import time
+import sys
+from pyqtgraph.Qt import QtWidgets, QtCore
 from datetime import datetime
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 import pytz
+import serial
+import time
+import os
+import threading
+import queue
 
-ser = serial.Serial('/dev/cu.usbserial-210', 115200)
+SERIAL_PORT = '/dev/cu.usbserial-110'
+BAUD_RATE = 115200
+CSV_FILENAME = "openlog_data.csv"
+SAVE_INTERVAL_SEC = 120  # 2 minutes
+CHECK_INTERVAL_SEC = 180  # 3 minutes
 
-# Field names for OPENLOG lines
 openlog_fields = [
     "UTCDateTime","mac_address","firmware_ver","hardware","current_temp_f","current_humidity",
     "current_dewpoint_f","pressure","adc","mem","rssi","uptime","pm1_0_cf_1","pm2_5_cf_1",
@@ -20,124 +26,150 @@ openlog_fields = [
     "p_2_5_um_b","p_5_0_um_b","p_10_0_um_b","gas"
 ]
 
-openlog_rows = []
-channel_rows = []
-
-openlog_last_save = time.time()
-channel_last_save = time.time()
-
-print("Collecting data... Press Ctrl+C to stop.")
-
 def fixNullValues(data):
-  if len(data) != 41:
-    data.append("0")
-  elif len(data) == 41:
-    return data
-  
-  if len(data) != 41:
-    data.insert(8, '0')
-  elif len(data) == 41:
+    if len(data) != 41:
+        data.append("0")
+    if len(data) != 41:
+        data.insert(8, '0')
+    if len(data) != 41:
+        data.insert(10, '0')
     return data
 
-  if len(data) != 41:
-    data.insert(10, '0')
-  elif len(data) == 41:
-    return data
-  return data
+def append_to_csv(dataframe, filename):
+    file_exists = os.path.exists(filename)
+    dataframe.to_csv(filename, mode='a', header=not file_exists, index=False)
 
-def plot_realtime(openlog_rows):
-    if not openlog_rows:
-        return
-    df = pd.DataFrame(openlog_rows)
+class SerialReader(threading.Thread):
+    def __init__(self, data_queue, stop_event):
+        super().__init__(daemon=True)
+        self.data_queue = data_queue
+        self.stop_event = stop_event
 
-    # Parse as UTC and convert to US/Eastern
-    df['UTCDateTime'] = pd.to_datetime(df['UTCDateTime'], errors='coerce', utc=True)
-    df['ESTDateTime'] = df['UTCDateTime'].dt.tz_convert('US/Eastern')
+    def run(self):
+        try:
+            ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+            print("Serial port opened.")
+            while not self.stop_event.is_set():
+                line = ser.readline().decode('utf-8').strip()
+                if not line:
+                    continue
+                if "OPENLOG" in line:
+                    data = line.split(",")
+                    data = fixNullValues(data)
+                    if len(openlog_fields) != len(data):
+                        continue
+                    row = dict(zip(openlog_fields, data))
+                    print(row)
+                    self.data_queue.put(row)
+        except Exception as e:
+            print("Serial thread error:", e)
 
-    for col in ['pm1_0_atm', 'pm2_5_atm', 'pm10_0_atm']:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    plt.clf()
-    plt.plot(df['ESTDateTime'], df['pm1_0_atm'], label='PM1.0 ATM', linestyle='-', marker='o', color="black")
-    plt.plot(df['ESTDateTime'], df['pm2_5_atm'], label='PM2.5 ATM', linestyle='-', marker='s', color="red")
-    plt.plot(df['ESTDateTime'], df['pm10_0_atm'], label='PM10.0 ATM', linestyle='-', marker='^', color="pink")
-    
-    plt.gcf().autofmt_xdate(rotation=30)
-    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%b %d %H:%M'))
-    plt.xlabel('Time (EST)')
-    plt.ylabel('Concentration (µg/m³)')
-    plt.legend()
-    plt.title('Real-time PM Data')
-    plt.pause(0.1)
-plt.ion()
-plt.figure()  # <-- Add this line
+class RealTimePlotter(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Real-time PM2.5 Data")
+        date_axis = pg.graphicsItems.DateAxisItem.DateAxisItem(orientation='bottom')
+        self.plot_widget = pg.PlotWidget(axisItems={'bottom': date_axis})
+        self.setCentralWidget(self.plot_widget)
+        self.curve = self.plot_widget.plot(
+            pen=pg.mkPen(color='b', width=2),
+            symbol='o', symbolSize=8,
+            symbolBrush=(0, 0, 255), symbolPen='w',
+            name='PM 2.5'  # This name is used by the legend
+        )
+        self.plot_widget.setLabel('left', "Concentration (µg/m³)", **{'color': '#FFF', 'font-size': '14pt'})
+        self.plot_widget.setLabel('bottom', "Time (EST)", **{'color': '#FFF', 'font-size': '14pt'})
+        pg.setConfigOptions(antialias=True)
+        self.bottom_axis = self.plot_widget.getAxis('bottom')
 
-try:
-    while True:
-        line = ser.readline().decode('utf-8').strip()
-        if not line:
-            continue
-        line = str(line)
-        if "OPENLOG" in line:
-            data = line.split(",")
-            data = fixNullValues(data)
-            if len(openlog_fields) != len(data):
-                continue
-            else:  
-                openlog_rows.append(dict(zip(openlog_fields, data)))
-                print(f"OPENLOG row added: {openlog_rows[-1]}")
-                if len(openlog_rows) > 1:
-                    plot_realtime(openlog_rows)
+        # Add legend
+        legend = pg.LegendItem(offset=(50, 10))
+        legend.setParentItem(self.plot_widget.graphicsItem())
+        legend.setBrush('w')
+        legend.addItem(self.curve, 'PM 2.5')
 
+        self.x_data = []
+        self.y_data = []
+        self.openlog_rows = []
+        self.last_save_time = time.time()
+        self.last_data_time = time.time()
+        self.data_queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.reader_thread = SerialReader(self.data_queue, self.stop_event)
+        self.reader_thread.start()
 
-        # Handle channel data (every second)
-        # elif 'DATA' in line:
-        #     try:
-        #         # Example: .0h07:54.763 2025/06/22T12:21:11z: DATA A(4),82,38,54,1018.77,...
-        #         parts = line.split()
-        #         dateTime_UTC = None
-        #         channel = None
-        #         values = None
-        #         for part in parts:
-        #             if part.endswith('z:'):
-        #                 dateTime_UTC = part[:-1]
-        #         if 'DATA' in line:
-        #             data_part = line.split('DATA', 1)[1].strip()
-        #             if ',' in data_part:
-        #                 channel, values_str = data_part.split(',', 1)
-        #                 values = values_str.split(',')
-        #         if dateTime_UTC and channel and values:
-        #             channel_rows.append({
-        #                 "dateTime_UTC": dateTime_UTC,
-        #                 "channel": channel,
-        #                 "value": values
-        #             })
-        #             print(f"Channel row added: {channel_rows[-1]}")
-        #     except Exception as e:
-        #         print(f"Error parsing channel data: {e}")
+        # Load existing CSV if present
+        self.load_existing_csv()
 
-        # Save OPENLOG data every 3 minutes
-        if time.time() - openlog_last_save > 180 and openlog_rows:
-            df_openlog = pd.DataFrame(openlog_rows)
-            df_openlog.to_csv("openlog_data.csv", index=False)
-            print(f"Saved OPENLOG data ({len(openlog_rows)} rows) to openlog_data.csv")
-            openlog_rows.clear()
-            openlog_last_save = time.time()
+        # Timer for periodic plot update and data check
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_from_queue)
+        self.timer.start(1000)  # Check every second
 
-        # Save channel data every 1 minute
-        # if time.time() - channel_last_save > 60 and channel_rows:
-        #     df_channel = pd.DataFrame(channel_rows)
-        #     df_channel.to_csv("channel_data.csv", index=False)
-        #     print(f"Saved channel data ({len(channel_rows)} rows) to channel_data.csv")
-        #     channel_rows.clear()
-        #     channel_last_save = time.time()
+    def load_existing_csv(self):
+        try:
+            df = pd.read_csv(CSV_FILENAME)
+            df['UTCDateTime'] = pd.to_datetime(df['UTCDateTime'], errors='coerce', utc=True)
+            df['ESTDateTime'] = df['UTCDateTime'].dt.tz_convert('US/Eastern')
+            df['pm2_5_atm'] = pd.to_numeric(df['pm2_5_atm'], errors='coerce')
+            self.x_data = df['ESTDateTime'].tolist()
+            self.y_data = df['pm2_5_atm'].tolist()
+            print(f"Loaded {len(self.x_data)} points from CSV.")
+        except Exception as e:
+            print("No File Found or error loading:", e)
+            self.x_data = []
+            self.y_data = []
 
-except KeyboardInterrupt:
-    print("Stopping collection...")
+    def update_from_queue(self):
+        new_data = False
+        while not self.data_queue.empty():
+            row = self.data_queue.get()
+            self.openlog_rows.append(row)
+            try:
+                utc_dt = pd.to_datetime(row['UTCDateTime'], errors='coerce', utc=True)
+                est_dt = utc_dt.tz_convert('US/Eastern')
+                pm25 = float(row['pm2_5_atm'])
+                self.x_data.append(est_dt)
+                self.y_data.append(pm25)
+                new_data = True
+                self.last_data_time = time.time()
+            except Exception as e:
+                print("Parse error:", e)
 
-# Final save on exit
-if openlog_rows:
-    pd.DataFrame(openlog_rows).to_csv("openlog_data.csv", index=False)
-if channel_rows:
-    pd.DataFrame(channel_rows).to_csv("channel_data.csv", index=False)
-print("Final data saved.")
-plt.show()
+        # Save every 2 minutes if new data
+        if time.time() - self.last_save_time > SAVE_INTERVAL_SEC and self.openlog_rows:
+            df_openlog = pd.DataFrame(self.openlog_rows)
+            append_to_csv(df_openlog, CSV_FILENAME)
+            print(f"Saved {len(self.openlog_rows)} rows to {CSV_FILENAME}")
+            self.openlog_rows.clear()
+            self.last_save_time = time.time()
+
+        # If no new data for 3 minutes, reload CSV and plot again
+        if not new_data and (time.time() - self.last_data_time > CHECK_INTERVAL_SEC):
+            print("No new data for 3 minutes, reloading CSV...")
+            self.load_existing_csv()
+            self.last_data_time = time.time()
+
+        self.update_plot()
+
+    def update_plot(self):
+        x_float = [dt.timestamp() for dt in self.x_data]
+        y_vals = self.y_data
+        self.curve.setData(x=x_float, y=y_vals)
+        ticks_primary = [(ts, datetime.fromtimestamp(ts).strftime("%m/%d\n%H:%M:%S")) for ts in x_float]
+        self.bottom_axis.setTicks([ticks_primary])
+
+    def closeEvent(self, event):
+        self.stop_event.set()
+        self.reader_thread.join()
+        # Final save on exit
+        if self.openlog_rows:
+            df_openlog = pd.DataFrame(self.openlog_rows)
+            append_to_csv(df_openlog, CSV_FILENAME)
+        event.accept()
+
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    win = RealTimePlotter()
+    win.show()
+    sys.exit(app.exec_())
